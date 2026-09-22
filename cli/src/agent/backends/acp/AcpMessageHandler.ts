@@ -43,6 +43,13 @@ type DerivedToolName = ReturnType<typeof deriveToolNameWithSource>;
 
 const REASONING_SNAPSHOT_INTERVAL_MS = 250;
 
+// ACP gives no "message finished" signal for a turn's last text segment. HAPI
+// buffers assistant text and only emits it at explicit boundaries (tool_call /
+// plan / image / rate-limit) or at turn-boundary drains; when neither arrives
+// the segment would sit in the buffer until the next user prompt. This idle
+// timer closes that gap without touching the turn lifecycle.
+const TEXT_IDLE_FLUSH_INTERVAL_MS = 1000;
+
 /**
  * Extracts _meta.kind from the first diff block in a content array.
  * Returns null when content is not an array, is empty, or the first block
@@ -396,10 +403,40 @@ function getSuffixPrefixOverlap(base: string, next: string): number {
     return 0;
 }
 
+// Control envelopes this codebase must never surface as visible assistant text
+// (see isInternalEventJson / parseRateLimitText). They arrive in pieces - delta
+// mode sends one fragment per chunk and cumulative dedupe can also hold a
+// partial one - so an early idle flush cannot tell a partial envelope from a
+// partial answer. Only these shapes are deferred; other JSON objects (a genuine
+// JSON answer, a brace-leading code fragment) are emitted normally, because
+// they can never become an envelope.
+const CONTROL_ENVELOPE_PREFIXES = ['{"type":"output"', '{"type":"rate_limit_event"'];
+
+/**
+ * True when `text` may be a control envelope that has not been fully received
+ * yet. Whitespace is ignored so leading indentation/newlines do not hide the
+ * shape. The boundary flush is the only place the reassembled text exists, so a
+ * deferred envelope is filtered there (that is what makes the filter complete
+ * rather than merely likely to fire).
+ */
+function mayBeUnfinishedControlEnvelope(text: string): boolean {
+    const compact = text.trimStart().replace(/\s+/g, '');
+    if (!compact.startsWith('{')) return false;
+    return CONTROL_ENVELOPE_PREFIXES.some(
+        (prefix) => compact.startsWith(prefix) || prefix.startsWith(compact)
+    );
+}
+
 export class AcpMessageHandler {
     private readonly toolCalls = new Map<string, { name: string; input: unknown }>();
     private acceptingUpdates = true;
     private bufferedText = '';
+    // Text already emitted by an idle flush for the current text segment. A
+    // later boundary flush (or the next idle flush) emits only the remainder,
+    // so each character is emitted at most once regardless of whether the
+    // agent streams cumulative chunks (dedupe mode) or fragments (delta mode).
+    private idleEmittedText = '';
+    private textIdleTimer: ReturnType<typeof setTimeout> | null = null;
     // Array buffer avoids the O(N²) string concatenation that per-token
     // ACP streams (OpenCode/Zen emits one chunk per generated token) would
     // otherwise incur — a 10k-token reasoning trace allocates 10k full-buffer
@@ -415,7 +452,7 @@ export class AcpMessageHandler {
 
     constructor(
         onMessage: (message: AgentMessage) => void,
-        private readonly options: { textChunkMode?: AcpTextChunkMode; flavor?: string } = {}
+        private readonly options: { textChunkMode?: AcpTextChunkMode; flavor?: string; textIdleFlushMs?: number } = {}
     ) {
         this.onMessage = (message) => {
             if (this.acceptingUpdates) onMessage(message);
@@ -427,6 +464,8 @@ export class AcpMessageHandler {
     deactivate(): void {
         this.acceptingUpdates = false;
         this.bufferedText = '';
+        this.idleEmittedText = '';
+        this.clearTextIdleFlushTimer();
         this.bufferedReasoning = [];
         this.resetReasoningState();
     }
@@ -444,17 +483,61 @@ export class AcpMessageHandler {
      * reassembled text exists, so it is the only place a split envelope can
      * be caught. Re-checking here is what makes the filter complete rather
      * than merely likely to fire.
+     *
+     * `mode` separates a true segment boundary from the idle timer's
+     * opportunistic flush: a boundary closes the segment (clearing both the
+     * buffer and the idle-emitted watermark), while an idle flush keeps the
+     * buffer open and records how much was emitted, so a later boundary emits
+     * only the remainder exactly once. Idle flushes defer while a reasoning
+     * block is still open or while the buffer may be an unfinished control
+     * envelope; the pending computation guarantees each character is emitted at
+     * most once (append growth emits the suffix; a prefix-prepended dedupe
+     * rewrite emits the prefix).
      */
-    flushText(): void {
-        if (!this.bufferedText) {
-            return;
-        }
+    flushText(mode: 'boundary' | 'idle' = 'boundary'): void {
         const text = this.bufferedText;
-        this.bufferedText = '';
-        if (isInternalEventJson(text)) {
+        if (!text) {
+            if (mode === 'boundary') {
+                this.idleEmittedText = '';
+                this.clearTextIdleFlushTimer();
+            }
             return;
         }
-        this.onMessage({ type: 'text', text });
+        if (mode === 'idle') {
+            // An open reasoning block would be pushed below the answer by an
+            // early text emission; the boundary drain exists to keep Reasoning
+            // above the answer (see drainBuffers), so defer to it.
+            if (this.bufferedReasoning.length > 0) return;
+            // Never stream a control envelope that has not been fully received
+            // yet (see mayBeUnfinishedControlEnvelope): the boundary flush is
+            // where a split envelope is reassembled and filtered.
+            if (mayBeUnfinishedControlEnvelope(text)) return;
+        }
+        const alreadyEmitted = this.idleEmittedText;
+        let pending = text;
+        if (alreadyEmitted) {
+            if (text.startsWith(alreadyEmitted)) {
+                // Append-only growth: emit the not-yet-emitted suffix.
+                pending = text.slice(alreadyEmitted.length);
+            } else if (text.endsWith(alreadyEmitted)) {
+                // The buffer was rewritten with a prefix prepended (the dedupe
+                // hardening branch in appendTextChunkContent), so the only
+                // not-yet-emitted content is that prefix. Emitting the whole
+                // text would repeat what was already sent.
+                pending = text.slice(0, text.length - alreadyEmitted.length);
+            }
+        }
+        if (mode === 'boundary') {
+            this.bufferedText = '';
+            this.idleEmittedText = '';
+            this.clearTextIdleFlushTimer();
+        } else {
+            this.idleEmittedText = text;
+        }
+        if (!pending || isInternalEventJson(text)) {
+            return;
+        }
+        this.onMessage({ type: 'text', text: pending });
     }
 
     /**
@@ -502,7 +585,39 @@ export class AcpMessageHandler {
         this.flushText();
     }
 
+    private clearTextIdleFlushTimer(): void {
+        if (this.textIdleTimer !== null) {
+            clearTimeout(this.textIdleTimer);
+            this.textIdleTimer = null;
+        }
+    }
+
+    /**
+     * (Re)arms the idle text flush. Called on every incoming update and after
+     * each appended text chunk so the timer only fires once the stream has been
+     * silent for a full interval. A non-positive `textIdleFlushMs` disables the
+     * timer entirely.
+     */
+    private refreshTextIdleFlushTimer(): void {
+        this.clearTextIdleFlushTimer();
+        const idleFlushMs = this.options.textIdleFlushMs ?? TEXT_IDLE_FLUSH_INTERVAL_MS;
+        if (idleFlushMs <= 0 || !this.bufferedText) {
+            return;
+        }
+        const timer = setTimeout(() => {
+            this.textIdleTimer = null;
+            this.flushText('idle');
+        }, idleFlushMs);
+        timer.unref?.();
+        this.textIdleTimer = timer;
+    }
+
     private appendTextChunk(text: string): void {
+        this.appendTextChunkContent(text);
+        this.refreshTextIdleFlushTimer();
+    }
+
+    private appendTextChunkContent(text: string): void {
         if (this.textChunkMode === 'delta') {
             if (text) {
                 this.bufferedText += text;
@@ -598,6 +713,10 @@ export class AcpMessageHandler {
         if (!isObject(update)) return;
         const updateType = asString(update.sessionUpdate);
         if (!updateType) return;
+
+        // Any activity postpones the idle text flush so a segment is not split
+        // while the agent is still working.
+        this.refreshTextIdleFlushTimer();
 
         if (updateType === ACP_SESSION_UPDATE_TYPES.agentThoughtChunk) {
             // Thought chunks do not participate in intra-turn ordering and

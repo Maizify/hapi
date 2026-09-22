@@ -2545,3 +2545,303 @@ describe('AcpMessageHandler', () => {
         clearGeneratedImages();
     });
 });
+
+describe('AcpMessageHandler idle text flush', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    function textMessages(messages: AgentMessage[]): Array<Extract<AgentMessage, { type: 'text' }>> {
+        return messages.filter((message): message is Extract<AgentMessage, { type: 'text' }> =>
+            message.type === 'text'
+        );
+    }
+
+    it('flushes buffered text after the idle interval without a boundary event', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello world' }
+        });
+
+        await vi.advanceTimersByTimeAsync(999);
+        expect(messages).toEqual([]);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(messages).toEqual([{ type: 'text', text: 'hello world' }]);
+
+        await vi.advanceTimersByTimeAsync(10000);
+        expect(textMessages(messages)).toHaveLength(1);
+    });
+
+    it('postpones the idle flush while updates keep arriving', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello ' }
+        });
+
+        await vi.advanceTimersByTimeAsync(600);
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'world' }
+        });
+
+        await vi.advanceTimersByTimeAsync(600);
+        expect(messages).toEqual([]);
+
+        await vi.advanceTimersByTimeAsync(400);
+        expect(messages).toEqual([{ type: 'text', text: 'hello world' }]);
+    });
+
+    it('does not emit text twice when a boundary flush follows an idle flush', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello' }
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toHaveLength(1);
+
+        handler.flushText();
+        expect(textMessages(messages)).toHaveLength(1);
+
+        handler.drainBuffers();
+        expect(textMessages(messages)).toHaveLength(1);
+    });
+
+    it('cancels the idle timer when a tool call closes the text segment', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello' }
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.toolCall,
+            toolCallId: 'tool-1',
+            title: 'Read',
+            rawInput: { path: 'README.md' },
+            status: 'in_progress'
+        });
+
+        expect(messages.map((m) => m.type)).toEqual(['text', 'tool_call']);
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(messages).toHaveLength(2);
+    });
+
+    it('dedupe mode emits only the not-yet-emitted suffix of a cumulative stream', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'Hello world.' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)[0]).toEqual({ type: 'text', text: 'Hello world.' });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'Hello world. And more.' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)[1]).toEqual({ type: 'text', text: ' And more.' });
+
+        handler.flushText();
+        expect(textMessages(messages)).toHaveLength(2);
+    });
+
+    it('stays silent when no text is buffered', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: 'thinking' }
+        });
+
+        await vi.advanceTimersByTimeAsync(10000);
+        expect(messages.filter((m) => m.type === 'text')).toEqual([]);
+    });
+
+    it('is disabled when textIdleFlushMs is zero', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 0
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello' }
+        });
+
+        await vi.advanceTimersByTimeAsync(10000);
+        expect(textMessages(messages)).toHaveLength(0);
+
+        handler.flushText();
+        expect(messages).toEqual([{ type: 'text', text: 'hello' }]);
+    });
+
+    it('stays idempotent for a repeated cumulative chunk after an idle flush', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'abc' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toHaveLength(1);
+        expect(textMessages(messages)[0]).toEqual({ type: 'text', text: 'abc' });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'abc' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toHaveLength(1);
+    });
+
+    it('does not repeat already-emitted text when a dedupe chunk prepends a prefix', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'world' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([{ type: 'text', text: 'world' }]);
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello world' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([
+            { type: 'text', text: 'world' },
+            { type: 'text', text: 'hello ' }
+        ]);
+    });
+
+    it('defers an incomplete internal envelope until a boundary flush drops it', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: '{"type":"ou' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([]);
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'tput","data":{"parentUuid":null,"sessionId":"s","userType":"x"}}' }
+        });
+        handler.drainBuffers();
+        expect(textMessages(messages)).toEqual([]);
+    });
+
+    it('still flushes a complete JSON answer at idle', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: '{"a":1}' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([{ type: 'text', text: '{"a":1}' }]);
+    });
+
+    it('keeps reasoning above the answer when a trailing thought arrives after text', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'the answer' }
+        });
+        await vi.advanceTimersByTimeAsync(100);
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentThoughtChunk,
+            content: { type: 'text', text: 'trailing thought' }
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([]);
+
+        handler.drainBuffers();
+
+        const ordered = messages.filter((message) => message.type === 'text' || message.type === 'reasoning');
+        const reasoningIndex = ordered.findIndex(
+            (message) => message.type === 'reasoning' && message.text.includes('trailing thought')
+        );
+        const textIndex = ordered.findIndex((message) => message.type === 'text');
+        expect(reasoningIndex).toBeGreaterThanOrEqual(0);
+        expect(textIndex).toBeGreaterThan(reasoningIndex);
+        expect(ordered[textIndex]).toEqual({ type: 'text', text: 'the answer' });
+    });
+
+    it('still flushes brace-leading text that cannot be a control envelope', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: '{"name":"hapi",' }
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([{ type: 'text', text: '{"name":"hapi",' }]);
+    });
+});
