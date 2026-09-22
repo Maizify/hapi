@@ -2577,7 +2577,7 @@ describe('AcpMessageHandler idle text flush', () => {
         expect(messages).toEqual([]);
 
         await vi.advanceTimersByTimeAsync(1);
-        expect(messages).toEqual([{ type: 'text', text: 'hello world' }]);
+        expect(messages).toEqual([{ type: 'text', text: 'hello world', id: expect.any(String), streamSnapshot: true, live: true }]);
 
         await vi.advanceTimersByTimeAsync(10000);
         expect(textMessages(messages)).toHaveLength(1);
@@ -2605,10 +2605,10 @@ describe('AcpMessageHandler idle text flush', () => {
         expect(messages).toEqual([]);
 
         await vi.advanceTimersByTimeAsync(400);
-        expect(messages).toEqual([{ type: 'text', text: 'hello world' }]);
+        expect(messages).toEqual([{ type: 'text', text: 'hello world', id: expect.any(String), streamSnapshot: true, live: true }]);
     });
 
-    it('does not emit text twice when a boundary flush follows an idle flush', async () => {
+    it('finalizes an idled segment under the same stream id at the boundary', async () => {
         const messages: AgentMessage[] = [];
         const handler = new AcpMessageHandler((message) => messages.push(message), {
             textChunkMode: 'delta',
@@ -2621,13 +2621,27 @@ describe('AcpMessageHandler idle text flush', () => {
         });
 
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toHaveLength(1);
+        const [snapshot] = textMessages(messages);
+        expect(snapshot).toEqual({
+            type: 'text',
+            text: 'hello',
+            id: expect.any(String),
+            streamSnapshot: true,
+            live: true
+        });
 
         handler.flushText();
-        expect(textMessages(messages)).toHaveLength(1);
+        const text = textMessages(messages);
+        expect(text).toHaveLength(2);
+        expect(text[1]).toEqual({
+            type: 'text',
+            text: 'hello',
+            id: snapshot.id,
+            streamSnapshot: true
+        });
 
         handler.drainBuffers();
-        expect(textMessages(messages)).toHaveLength(1);
+        expect(textMessages(messages)).toHaveLength(2);
     });
 
     it('cancels the idle timer when a tool call closes the text segment', async () => {
@@ -2656,7 +2670,7 @@ describe('AcpMessageHandler idle text flush', () => {
         expect(messages).toHaveLength(2);
     });
 
-    it('dedupe mode emits only the not-yet-emitted suffix of a cumulative stream', async () => {
+    it('dedupe mode streams full-text snapshots under one stream id', async () => {
         const messages: AgentMessage[] = [];
         const handler = new AcpMessageHandler((message) => messages.push(message), {
             textIdleFlushMs: 1000
@@ -2667,17 +2681,24 @@ describe('AcpMessageHandler idle text flush', () => {
             content: { type: 'text', text: 'Hello world.' }
         });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)[0]).toEqual({ type: 'text', text: 'Hello world.' });
 
         await handler.handleUpdate({
             sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
             content: { type: 'text', text: 'Hello world. And more.' }
         });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)[1]).toEqual({ type: 'text', text: ' And more.' });
 
         handler.flushText();
-        expect(textMessages(messages)).toHaveLength(2);
+
+        const text = textMessages(messages);
+        expect(text).toHaveLength(3);
+        expect(text[0].text).toEqual('Hello world.');
+        expect(text[1].text).toEqual('Hello world. And more.');
+        expect(text[2].text).toEqual('Hello world. And more.');
+        expect(text[0].id).toEqual(expect.any(String));
+        expect(text[1].id).toEqual(text[0].id);
+        expect(text[2].id).toEqual(text[0].id);
+        expect(text[2].streamSnapshot).toBe(true);
     });
 
     it('stays silent when no text is buffered', async () => {
@@ -2714,7 +2735,7 @@ describe('AcpMessageHandler idle text flush', () => {
         expect(messages).toEqual([{ type: 'text', text: 'hello' }]);
     });
 
-    it('stays idempotent for a repeated cumulative chunk after an idle flush', async () => {
+    it('re-asserts the same snapshot for a repeated cumulative chunk', async () => {
         const messages: AgentMessage[] = [];
         const handler = new AcpMessageHandler((message) => messages.push(message), {
             textIdleFlushMs: 1000
@@ -2725,18 +2746,21 @@ describe('AcpMessageHandler idle text flush', () => {
             content: { type: 'text', text: 'abc' }
         });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toHaveLength(1);
-        expect(textMessages(messages)[0]).toEqual({ type: 'text', text: 'abc' });
 
         await handler.handleUpdate({
             sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
             content: { type: 'text', text: 'abc' }
         });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toHaveLength(1);
+
+        const text = textMessages(messages);
+        expect(text).toHaveLength(2);
+        expect(text[0].id).toEqual(expect.any(String));
+        expect(text[1].id).toEqual(text[0].id);
+        expect(text[1].text).toEqual('abc');
     });
 
-    it('does not repeat already-emitted text when a dedupe chunk prepends a prefix', async () => {
+    it('settles a prepend-then-append rewrite on the full answer under one stream id', async () => {
         const messages: AgentMessage[] = [];
         const handler = new AcpMessageHandler((message) => messages.push(message), {
             textIdleFlushMs: 1000
@@ -2747,17 +2771,30 @@ describe('AcpMessageHandler idle text flush', () => {
             content: { type: 'text', text: 'world' }
         });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toEqual([{ type: 'text', text: 'world' }]);
 
         await handler.handleUpdate({
             sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
             content: { type: 'text', text: 'hello world' }
         });
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'hello world!' }
+        });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toEqual([
-            { type: 'text', text: 'world' },
-            { type: 'text', text: 'hello ' }
-        ]);
+
+        handler.flushText();
+
+        const text = textMessages(messages);
+        expect(text).toHaveLength(3);
+        const id = text[0].id;
+        expect(id).toEqual(expect.any(String));
+        for (const message of text) {
+            expect(message.id).toEqual(id);
+        }
+        expect(text[0].text).toEqual('world');
+        expect(text[1].text).toEqual('hello world!');
+        expect(text[2].text).toEqual('hello world!');
+        expect(text.some((message) => message.text === 'hello ')).toBe(false);
     });
 
     it('defers an incomplete internal envelope until a boundary flush drops it', async () => {
@@ -2794,7 +2831,7 @@ describe('AcpMessageHandler idle text flush', () => {
             content: { type: 'text', text: '{"a":1}' }
         });
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toEqual([{ type: 'text', text: '{"a":1}' }]);
+        expect(textMessages(messages)).toEqual([{ type: 'text', text: '{"a":1}', id: expect.any(String), streamSnapshot: true, live: true }]);
     });
 
     it('keeps reasoning above the answer when a trailing thought arrives after text', async () => {
@@ -2842,6 +2879,57 @@ describe('AcpMessageHandler idle text flush', () => {
         });
 
         await vi.advanceTimersByTimeAsync(1000);
-        expect(textMessages(messages)).toEqual([{ type: 'text', text: '{"name":"hapi",' }]);
+        expect(textMessages(messages)).toEqual([{ type: 'text', text: '{"name":"hapi",', id: expect.any(String), streamSnapshot: true, live: true }]);
+    });
+
+    it('defers a control envelope whose data key arrives before type', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: '{"data":{"parentUuid":null,"sessionId":"s","userType":"x"},' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([]);
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: '"type":"output"}' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(textMessages(messages)).toEqual([]);
+
+        handler.drainBuffers();
+        expect(textMessages(messages)).toEqual([]);
+    });
+
+    it('keeps one stream id across an idle gap inside an open code fence', async () => {
+        const messages: AgentMessage[] = [];
+        const handler = new AcpMessageHandler((message) => messages.push(message), {
+            textChunkMode: 'delta',
+            textIdleFlushMs: 1000
+        });
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: '```js\nconst a = 1;\n' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+
+        await handler.handleUpdate({
+            sessionUpdate: ACP_SESSION_UPDATE_TYPES.agentMessageChunk,
+            content: { type: 'text', text: 'console.log(a);\n```' }
+        });
+        await vi.advanceTimersByTimeAsync(1000);
+
+        const text = textMessages(messages);
+        expect(text).toHaveLength(2);
+        expect(text[0].id).toEqual(expect.any(String));
+        expect(text[1].id).toEqual(text[0].id);
+        expect(text[1].text).toEqual('```js\nconst a = 1;\nconsole.log(a);\n```');
     });
 });

@@ -407,35 +407,67 @@ function getSuffixPrefixOverlap(base: string, next: string): number {
 // (see isInternalEventJson / parseRateLimitText). They arrive in pieces - delta
 // mode sends one fragment per chunk and cumulative dedupe can also hold a
 // partial one - so an early idle flush cannot tell a partial envelope from a
-// partial answer. Only these shapes are deferred; other JSON objects (a genuine
-// JSON answer, a brace-leading code fragment) are emitted normally, because
-// they can never become an envelope.
-const CONTROL_ENVELOPE_PREFIXES = ['{"type":"output"', '{"type":"rate_limit_event"'];
+// partial answer. A partial object stays deferred only while its first key (or
+// its `type` value) can still turn out to be an envelope, so property order is
+// not assumed and brace-leading text that is ruled out immediately (e.g.
+// `{"name":...`) still flushes at idle.
+const CONTROL_ENVELOPE_KEYS = ['data', 'rate_limit_info', 'type'];
+const CONTROL_ENVELOPE_TYPES = ['output', 'rate_limit_event'];
+
+function isCompleteJsonObject(text: string): boolean {
+    try {
+        JSON.parse(text);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 /**
  * True when `text` may be a control envelope that has not been fully received
- * yet. Whitespace is ignored so leading indentation/newlines do not hide the
- * shape. The boundary flush is the only place the reassembled text exists, so a
- * deferred envelope is filtered there (that is what makes the filter complete
- * rather than merely likely to fire).
+ * yet. A complete object is never a candidate: a fully received envelope is
+ * filtered by isInternalEventJson / the rate-limit parser instead, and a
+ * genuine JSON answer must be able to flush at idle. For a partial object the
+ * answer is decided from the first key as far as it has arrived: once the key
+ * (or a `type` value) can no longer become an envelope shape, the text is
+ * ordinary content and may be emitted. Whitespace is ignored so leading
+ * indentation or embedded newlines do not hide the shape. The boundary flush
+ * is where a split envelope is reassembled and filtered.
  */
 function mayBeUnfinishedControlEnvelope(text: string): boolean {
+    if (isCompleteJsonObject(text)) return false;
     const compact = text.trimStart().replace(/\s+/g, '');
     if (!compact.startsWith('{')) return false;
-    return CONTROL_ENVELOPE_PREFIXES.some(
-        (prefix) => compact.startsWith(prefix) || prefix.startsWith(compact)
-    );
+    const keyMatch = /^\{"([A-Za-z_][A-Za-z0-9_-]*)/.exec(compact);
+    if (!keyMatch) return true;
+    const key = keyMatch[1];
+    if (compact[keyMatch[0].length] !== '"') {
+        return CONTROL_ENVELOPE_KEYS.some((candidate) => candidate.startsWith(key));
+    }
+    if (!CONTROL_ENVELOPE_KEYS.includes(key)) return false;
+    if (key !== 'type') return true;
+    const afterKey = compact.slice(keyMatch[0].length + 1);
+    const valueMatch = /^:"([A-Za-z_]*)/.exec(afterKey);
+    if (!valueMatch) return true;
+    const value = valueMatch[1];
+    if (afterKey[valueMatch[0].length] !== '"') {
+        return CONTROL_ENVELOPE_TYPES.some((candidate) => candidate.startsWith(value));
+    }
+    return CONTROL_ENVELOPE_TYPES.includes(value);
 }
 
 export class AcpMessageHandler {
     private readonly toolCalls = new Map<string, { name: string; input: unknown }>();
     private acceptingUpdates = true;
     private bufferedText = '';
-    // Text already emitted by an idle flush for the current text segment. A
-    // later boundary flush (or the next idle flush) emits only the remainder,
-    // so each character is emitted at most once regardless of whether the
-    // agent streams cumulative chunks (dedupe mode) or fragments (delta mode).
-    private idleEmittedText = '';
+    // Stable stream id for a text segment that has already been emitted by an
+    // idle flush. Mirrors the reasoning snapshot scheme (see flushReasoning):
+    // the web reducer replaces a text block in place when a repeated stream id
+    // arrives, so later snapshots settle the segment without duplicating or
+    // reordering what is already rendered. Null until the first idle emission
+    // of the current segment; a boundary that never saw one keeps the upstream
+    // message shape (no id).
+    private textStreamId: string | null = null;
     private textIdleTimer: ReturnType<typeof setTimeout> | null = null;
     // Array buffer avoids the O(N²) string concatenation that per-token
     // ACP streams (OpenCode/Zen emits one chunk per generated token) would
@@ -464,80 +496,76 @@ export class AcpMessageHandler {
     deactivate(): void {
         this.acceptingUpdates = false;
         this.bufferedText = '';
-        this.idleEmittedText = '';
+        this.textStreamId = null;
         this.clearTextIdleFlushTimer();
         this.bufferedReasoning = [];
         this.resetReasoningState();
     }
 
     /**
-     * Emits any buffered assistant text as a single message and clears the
-     * buffer. Callers must treat this as a text-segment boundary: it is
-     * invoked internally before tool_call / plan events and externally at
-     * turn boundaries by AcpSdkBackend.
+     * Emits buffered assistant text. A true segment boundary clears the buffer
+     * and is invoked internally before tool_call / plan events and externally
+     * at turn boundaries by AcpSdkBackend; `mode: 'idle'` is the idle timer's
+     * opportunistic flush (see refreshTextIdleFlushTimer).
      *
      * The internal-event check in `handleUpdate` only sees one chunk at a
-     * time, so it cannot recognise an envelope that arrived in pieces — in
+     * time, so it cannot recognise an envelope that arrived in pieces - in
      * `delta` mode (OpenCode) every chunk is a fragment and none of them
-     * parses as JSON on its own. This flush boundary is the first place the
-     * reassembled text exists, so it is the only place a split envelope can
-     * be caught. Re-checking here is what makes the filter complete rather
-     * than merely likely to fire.
+     * parses as JSON on its own. This flush (or the boundary) is the first
+     * place the reassembled text exists, so it is the only place a split
+     * envelope can be caught. Re-checking here is what makes the filter
+     * complete rather than merely likely to fire.
      *
-     * `mode` separates a true segment boundary from the idle timer's
-     * opportunistic flush: a boundary closes the segment (clearing both the
-     * buffer and the idle-emitted watermark), while an idle flush keeps the
-     * buffer open and records how much was emitted, so a later boundary emits
-     * only the remainder exactly once. Idle flushes defer while a reasoning
-     * block is still open or while the buffer may be an unfinished control
-     * envelope; the pending computation guarantees each character is emitted at
-     * most once (append growth emits the suffix; a prefix-prepended dedupe
-     * rewrite emits the prefix).
+     * Idle emissions stream full-text snapshots under a stable id, matching
+     * flushReasoning: the reducer replaces a text block in place for a
+     * repeated stream id, so a pause inside an open Markdown fence does not
+     * split the rendered answer, and a dedupe rewrite settles on the full text
+     * instead of emitting a reordered prefix. The boundary then emits one
+     * final message with the same id, or the plain upstream shape when no idle
+     * emission happened.
+     *
+     * Idle flushes defer, keeping the buffer open, while a reasoning block is
+     * still open (the boundary drain exists to keep Reasoning above the
+     * answer - see drainBuffers) or while the buffer may still be a control
+     * envelope (see mayBeUnfinishedControlEnvelope).
      */
     flushText(mode: 'boundary' | 'idle' = 'boundary'): void {
         const text = this.bufferedText;
         if (!text) {
             if (mode === 'boundary') {
-                this.idleEmittedText = '';
+                this.textStreamId = null;
                 this.clearTextIdleFlushTimer();
             }
             return;
         }
         if (mode === 'idle') {
-            // An open reasoning block would be pushed below the answer by an
-            // early text emission; the boundary drain exists to keep Reasoning
-            // above the answer (see drainBuffers), so defer to it.
             if (this.bufferedReasoning.length > 0) return;
-            // Never stream a control envelope that has not been fully received
-            // yet (see mayBeUnfinishedControlEnvelope): the boundary flush is
-            // where a split envelope is reassembled and filtered.
             if (mayBeUnfinishedControlEnvelope(text)) return;
-        }
-        const alreadyEmitted = this.idleEmittedText;
-        let pending = text;
-        if (alreadyEmitted) {
-            if (text.startsWith(alreadyEmitted)) {
-                // Append-only growth: emit the not-yet-emitted suffix.
-                pending = text.slice(alreadyEmitted.length);
-            } else if (text.endsWith(alreadyEmitted)) {
-                // The buffer was rewritten with a prefix prepended (the dedupe
-                // hardening branch in appendTextChunkContent), so the only
-                // not-yet-emitted content is that prefix. Emitting the whole
-                // text would repeat what was already sent.
-                pending = text.slice(0, text.length - alreadyEmitted.length);
+            // A complete envelope can only reach this point unchecked by the
+            // guard; never let one become visible text.
+            if (isInternalEventJson(text)) return;
+            if (!this.textStreamId) {
+                this.textStreamId = randomUUID();
             }
-        }
-        if (mode === 'boundary') {
-            this.bufferedText = '';
-            this.idleEmittedText = '';
-            this.clearTextIdleFlushTimer();
-        } else {
-            this.idleEmittedText = text;
-        }
-        if (!pending || isInternalEventJson(text)) {
+            this.onMessage({
+                type: 'text',
+                text,
+                id: this.textStreamId,
+                streamSnapshot: true,
+                live: true
+            });
             return;
         }
-        this.onMessage({ type: 'text', text: pending });
+        const id = this.textStreamId;
+        this.bufferedText = '';
+        this.textStreamId = null;
+        this.clearTextIdleFlushTimer();
+        if (isInternalEventJson(text)) {
+            return;
+        }
+        this.onMessage(id
+            ? { type: 'text', text, id, streamSnapshot: true }
+            : { type: 'text', text });
     }
 
     /**
